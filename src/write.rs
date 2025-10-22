@@ -53,7 +53,7 @@ enum MaybeEncrypted<W> {
     ZipCrypto(crate::zipcrypto::ZipCryptoWriter<W>),
 }
 
-impl<W: Write> MaybeEncrypted<W> {
+impl<W: Write + Seek> MaybeEncrypted<W> {
     fn get_ref(&self) -> &W {
         match self {
             MaybeEncrypted::Unencrypted(w) => w,
@@ -1068,7 +1068,7 @@ impl<W: Write + Seek> ZipWriter<W> {
             aes_mode,
             &extra_data,
         );
-        file.using_data_descriptor = !self.seek_possible;
+        file.using_data_descriptor = !self.seek_possible || matches!(options.encrypt_with, Some(EncryptWith::ZipCrypto(..)));
         file.version_made_by = file.version_made_by.max(file.version_needed() as u8);
         file.extra_data_start = Some(header_end);
         let index = self.insert_file_data(file)?;
@@ -1101,14 +1101,18 @@ impl<W: Write + Seek> ZipWriter<W> {
                 self.inner = Storer(MaybeEncrypted::Aes(aeswriter));
             }
             Some(EncryptWith::ZipCrypto(keys, ..)) => {
+                let file = &mut self.files[index];
+                // With ZipCrypto, we _need_ to use a data descriptor so that
+                // we can initialize the stream properly.
                 let mut zipwriter = crate::zipcrypto::ZipCryptoWriter {
                     writer: mem::replace(&mut self.inner, Closed).unwrap(),
-                    buffer: vec![],
                     keys,
                 };
                 self.stats.start = zipwriter.writer.stream_position()?;
                 // crypto_header is counted as part of the data
-                let crypto_header = [0u8; 12];
+                let mut crypto_header = [0u8; 12];
+                // Last two bytes should be the CRC of the file, or, .
+                crypto_header[10..=11].copy_from_slice(&file.last_modified_time.unwrap_or_else(DateTime::default_for_write).timepart().to_le_bytes());
                 let result = zipwriter.write_all(&crypto_header);
                 self.ok_or_abort_file(result)?;
                 self.inner = Storer(MaybeEncrypted::ZipCrypto(zipwriter));
@@ -1200,8 +1204,7 @@ impl<W: Write + Seek> ZipWriter<W> {
                 self.inner = Storer(MaybeEncrypted::Unencrypted(writer.finish()?));
             }
             Storer(MaybeEncrypted::ZipCrypto(writer)) => {
-                let crc32 = self.stats.hasher.clone().finalize();
-                self.inner = Storer(MaybeEncrypted::Unencrypted(writer.finish(crc32)?))
+                self.inner = Storer(MaybeEncrypted::Unencrypted(writer.finish()?))
             }
             Storer(MaybeEncrypted::Unencrypted(w)) => {
                 self.inner = Storer(MaybeEncrypted::Unencrypted(w))
